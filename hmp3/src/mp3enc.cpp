@@ -195,6 +195,14 @@ CMp3Enc::CMp3Enc (  ):
     audio_buf[1][0] = buf2 + 576;
     audio_buf[1][1] = buf2;
 
+// A1 re-coding, set up by L3_audio_encode_init
+    a1_on = 0;
+    a1_keep_gain = 0;
+    a1_stats_flag = 0;
+    a1ctx = NULL;
+    a1_scratch = NULL;
+    memset ( &a1st, 0, sizeof ( a1st ) );
+
 }
 
 /*--------------------------------------------------------------------*/
@@ -212,6 +220,14 @@ CMp3Enc::~CMp3Enc (  )
     if ( src_pcmbuf != NULL )
     {
         delete[]src_pcmbuf;
+    }
+    if ( a1_scratch != NULL )
+    {
+        delete[]a1_scratch;
+    }
+    if ( a1ctx != NULL )
+    {
+        a1_destroy ( a1ctx );
     }
 }
 
@@ -835,6 +851,8 @@ CMp3Enc::L3_audio_encode_init ( E_CONTROL * ec_arg )
     tot_frames_out = 0;
     tot_bytes_out = 0;
     ave_tot_bytes_out = 0;
+
+    a1_reset (  );      // A1 re-coding: on for MPEG-1 VBR unless HMP3_A1=0
 
 /* save as encoded control data for info return */
     ec_global = ec;
@@ -1585,6 +1603,8 @@ CMp3Enc::encode_jointB (  )
             ba_max -= bits;
             side_info.gr[igr][ch].part2_3_length = bits;
         }
+        if ( a1_on )
+            a1_capture ( igr ); // ix[] is reused by the next granule
         ba_min += ba_bit_min + sf_bits;
         ba_max = ba_max - dba_max;
         ba_max += ba_bit_max + sf_bits;
@@ -1741,6 +1761,8 @@ CMp3Enc::encode_singleB (  )
         ba_min += ba_bit_min + sf_bit_max - bits;
         ba_max += ba_bit_max + sf_bit_max - bits;
         side_info.gr[igr][0].part2_3_length = bits;
+        if ( a1_on )
+            a1_capture ( igr ); // ix[] is reused by the next granule
     }
 
     return 0;   // no ms mode/allocation
@@ -2112,6 +2134,8 @@ CMp3Enc::L3_audio_encode_vbr_MPEG1 ( float *pcm, unsigned char *bs_out )
     int ms_encoded;
     int bytes2, bytes3;
     int ibr;
+    unsigned char *bs_user = bs_out;    // A1: the stock frames go to a1_scratch
+    unsigned int frames0 = tot_frames_out;
 
     iframe++;
     filter2 ( pcm, buf1, buf2, &fc2 );
@@ -2172,6 +2196,10 @@ CMp3Enc::L3_audio_encode_vbr_MPEG1 ( float *pcm, unsigned char *bs_out )
 /* pack side info */
     L3_pack_side_MPEG1 ( side_buf[side_p1], &side_info, nchan );
 
+/* A1: re-code the frame into the A1 stream (stock main data still at main_p1) */
+    if ( a1_on )
+        a1_add_frame ( bytes, byte_pool + vbr_main_framebytes[ibr] - bytes );
+
     main_tot += bytes;
     main_bytes += bytes;
     main_p1 += bytes;
@@ -2181,6 +2209,8 @@ CMp3Enc::L3_audio_encode_vbr_MPEG1 ( float *pcm, unsigned char *bs_out )
 /*---------------------------------------*/
 
 /* try to output one or more frames */
+    if ( a1_on )
+        bs_out = a1_scratch;    // stock stream: kept for its byte accounting only
     bs_out0 = bs_out;
     for ( ; side_p0 != side_p1; )
     {
@@ -2205,6 +2235,13 @@ CMp3Enc::L3_audio_encode_vbr_MPEG1 ( float *pcm, unsigned char *bs_out )
         side_p0 = ( side_p0 + 1 ) & 31;
     }
     bytesout = bs_out - bs_out0;
+    if ( a1_on )
+    {   // output the A1 stream instead
+        a1st.stock_stream_bytes += bytesout;
+        a1st.stock_stream_frames += tot_frames_out - frames0;
+        tot_frames_out = frames0;
+        bytesout = a1_output ( bs_user );
+    }
     tot_bytes_out += bytesout;
     ave_tot_bytes_out = ave_tot_bytes_out +
         ( ( ( ( bytesout << 8 ) - ave_tot_bytes_out ) ) >> 7 );
@@ -2223,6 +2260,180 @@ CMp3Enc::L3_audio_encode_vbr_MPEG1 ( float *pcm, unsigned char *bs_out )
     x.out_bytes = bytesout;
 
     return x;
+}
+
+/*====================================================================*/
+/* A1: lossless re-coding of every frame (MPEG-1 VBR), see a1pack.h   */
+/*====================================================================*/
+#define A1_SCRATCH_BYTES (64*1024)      // > 32 frames of 1441 bytes
+
+void
+CMp3Enc::a1_reset (  )
+{
+    const char *e = getenv ( "HMP3_A1" );
+    const char *s = getenv ( "HMP3_A1STATS" );
+
+    a1_on = ( h_id == 1 )
+        && ( iL3_audio_encode_function == iL3_audio_encode_vbr_MPEG1 )
+        && ( iencode_function == iencode_jointB
+             || iencode_function == iencode_singleB );
+    if ( e != NULL && e[0] == '0' )
+        a1_on = 0;      // HMP3_A1=0: stock output
+    // HMP3_A1=1: keep global_gain, so minimp3 too outputs identical PCM (a1pack.h)
+    a1_keep_gain = ( e != NULL && e[0] == '1' );
+    a1_stats_flag = ( s != NULL && s[0] != '\0' && s[0] != '0' );
+
+    memset ( &a1st, 0, sizeof ( a1st ) );
+    memset ( &a1f, 0, sizeof ( a1f ) );
+    a1_main_p0 = a1_main_p1 = 0;
+    a1_side_p0 = a1_side_p1 = 0;
+    a1_main_tot = a1_main_sent = a1_mf_tot = 0;
+    a1_main_bytes = 0;
+    if ( a1ctx != NULL )
+    {
+        a1_destroy ( a1ctx );
+        a1ctx = NULL;
+    }
+    if ( a1_on )
+    {
+        a1ctx = a1_create ( sr_index, a1_keep_gain );
+        if ( a1_scratch == NULL )
+            a1_scratch = new unsigned char[A1_SCRATCH_BYTES];
+        if ( a1ctx == NULL || a1_scratch == NULL )
+            a1_on = 0;
+    }
+}
+
+/*--------------------------------------------------------------------*/
+void
+CMp3Enc::a1_capture ( int igr )
+{
+    int ch;
+
+    for ( ch = 0; ch < nchan; ch++ )
+    {
+        memcpy ( a1f.ix[igr][ch], ix[ch], sizeof ( a1f.ix[igr][ch] ) );
+        memcpy ( a1f.sign[igr][ch], signx[ch], sizeof ( a1f.sign[igr][ch] ) );
+    }
+}
+
+/*--------------------------------------------------------------------*/
+// Re-code the frame just packed by the stock code (its main data starts at
+// main_buf + main_p1) and add it to the A1 stream.
+//
+// Frame size rule: the smallest bitrate whose frame leaves the A1 reservoir
+// at least as full as the stock reservoir after the same frame. The stock
+// frame size always qualifies, since the A1 reservoir is never smaller and the
+// A1 main data never larger, so every A1 frame fits and is never larger than
+// the stock frame. A reservoir above 511 bytes is padded with zeros, as stock.
+void
+CMp3Enc::a1_add_frame ( int stock_bytes, int stock_pool_after )
+{
+    SIDE_INFO si_out;
+    int pool, n, ibr, after;
+
+    pool = ( int ) ( a1_mf_tot - a1_main_tot );    // A1 main_data_begin
+    a1_frame_info[a1_side_p1].main_pos = a1_main_tot;
+
+    n = a1_recode_frame ( a1ctx, &side_info, sf, nchan, &a1f, main_buf + main_p1,
+                          a1_main_buf + a1_main_p1, &si_out, &a1st );
+    assert ( n <= stock_bytes );
+
+    for ( ibr = ivbr_min; ibr < ivbr_max; ibr++ )
+        if ( pool + vbr_main_framebytes[ibr] - n >= stock_pool_after )
+            break;
+    after = pool + vbr_main_framebytes[ibr] - n;
+    assert ( after >= stock_pool_after );
+    if ( after > 511 )
+    {   // reservoir full: pad
+        memset ( a1_main_buf + a1_main_p1 + n, 0, after - 511 );
+        n += after - 511;
+    }
+
+    L3_pack_side_MPEG1 ( a1_side_buf[a1_side_p1], &si_out, nchan );
+    a1_mode_ext_buf[a1_side_p1] = mode_ext_buf[side_p1];
+    a1_br_index_buf[a1_side_p1] = ( unsigned char ) ibr;
+    a1_frame_info[a1_side_p1].mf_bytes = vbr_main_framebytes[ibr];
+
+    a1_main_tot += n;
+    a1_main_bytes += n;
+    a1_main_p1 += n;
+    a1_mf_tot += vbr_main_framebytes[ibr];
+    a1_side_p1 = ( a1_side_p1 + 1 ) & 31;
+}
+
+/*--------------------------------------------------------------------*/
+// Output every complete A1 frame; same logic as the stock VBR output loop.
+int
+CMp3Enc::a1_output ( unsigned char *bs_out )
+{
+    unsigned char *bs_out0 = bs_out;
+    int main_data_begin;
+
+    for ( ; a1_side_p0 != a1_side_p1; )
+    {
+        if ( a1_main_bytes < a1_frame_info[a1_side_p0].mf_bytes )
+            break;
+        tot_frames_out++;
+        main_data_begin = a1_main_sent - a1_frame_info[a1_side_p0].main_pos;
+        a1_main_sent += a1_frame_info[a1_side_p0].mf_bytes;
+        bs_out += L3_pack_head_vbr ( bs_out,
+                                     a1_mode_ext_buf[a1_side_p0],
+                                     a1_br_index_buf[a1_side_p0] );
+        a1_side_buf[a1_side_p0][0] = main_data_begin >> 1;
+        a1_side_buf[a1_side_p0][1] |= ( main_data_begin & 1 ) << 7;
+        memmove ( bs_out, a1_side_buf[a1_side_p0], side_bytes );
+        bs_out += side_bytes;
+        memmove ( bs_out, a1_main_buf + a1_main_p0,
+                  a1_frame_info[a1_side_p0].mf_bytes );
+        bs_out += a1_frame_info[a1_side_p0].mf_bytes;
+
+        a1_main_bytes -= a1_frame_info[a1_side_p0].mf_bytes;
+        a1_main_p0 += a1_frame_info[a1_side_p0].mf_bytes;
+        a1_side_p0 = ( a1_side_p0 + 1 ) & 31;
+        a1st.a1_stream_frames++;
+    }
+    a1st.a1_stream_bytes += bs_out - bs_out0;
+
+/* shift main buffer */
+    if ( a1_main_p1 > MB_TRIGGER )
+    {
+        a1_main_p1 = a1_main_p1 - a1_main_p0;
+        memmove ( a1_main_buf, a1_main_buf + a1_main_p0, a1_main_p1 );
+        a1_main_p0 = 0;
+    }
+
+    return bs_out - bs_out0;
+}
+
+/*--------------------------------------------------------------------*/
+void
+CMp3Enc::a1_print_stats ( FILE * f )
+{
+    const A1STATS *s = &a1st;
+    double sb = s->stock_bits, ab = s->a1_bits;
+
+    if ( !a1_stats_flag || s->frames <= 0 )
+        return;
+    fprintf ( f, "\n A1 re-coding: %.0f frames, %.0f of %.0f channels kept as coded",
+              s->frames, s->copied_channels, s->frames * nchan );
+    fprintf ( f, "\n   main data bits   stock %12.0f   A1 %12.0f   %+.3f%%",
+              sb, ab, sb > 0 ? 100.0 * ( ab - sb ) / sb : 0.0 );
+    fprintf ( f, "\n     scalefactors   stock %12.0f   A1 %12.0f",
+              s->stock_part2, s->a1_part2 );
+    fprintf ( f, "\n     Huffman        stock %12.0f   A1 %12.0f",
+              s->stock_part3, s->a1_part3 );
+    fprintf ( f, "\n   stream bytes     stock %12.0f   A1 %12.0f   %+.3f%%"
+              "   (frames out: stock %.0f, A1 %.0f)",
+              s->stock_stream_bytes, s->a1_stream_bytes,
+              s->stock_stream_bytes > 0 ? 100.0 * ( s->a1_stream_bytes -
+                                                     s->stock_stream_bytes ) /
+              s->stock_stream_bytes : 0.0, s->stock_stream_frames,
+              s->a1_stream_frames );
+    fprintf ( f, "\n   checks: %.0f stock mismatches, %.0f re-codings rejected,"
+              " %.0f scfsi quirks, %.0f big_values at window edge\n",
+              s->stock_mismatches, s->check_failures, s->stock_scfsi_quirks,
+              s->nbig_window_hits );
 }
 
 /*====================================================================*/

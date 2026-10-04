@@ -114,6 +114,7 @@
     </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\a1pack.c" />
     <ClCompile Include="src\amodini2.c" />
     <ClCompile Include="src\bitallo.cpp" />
     <ClCompile Include="src\bitallo1.cpp" />

@@ -63,6 +63,8 @@
 
 #include "srcc.h"       // sample rate converstion
 
+#include "a1pack.h"     // A1 lossless re-coding (MPEG-1 VBR)
+
 typedef struct
 {
     int a;
@@ -139,6 +141,7 @@ class CMp3Enc
 
     //=== test routine
     void out_stats (  );
+    void a1_print_stats ( FILE * f );   // A1 re-coding summary, if A1 ran
 
 //-data------------------------------------------------
   private:
@@ -290,6 +293,32 @@ class CMp3Enc
     unsigned int mf_tot;        /* total main data frame bytes */
     signed int main_bytes;      /* current bytes in main data buf */
 
+/*------- A1: lossless re-coding of every frame (MPEG-1 VBR) ---------*/
+// The stock stream above is still built in full, because the bit allocator's
+// budget depends on its byte pool. Each frame is then re-coded into a second
+// stream with its own bit reservoir; only that stream is output.
+    int a1_on;
+    int a1_keep_gain;
+    int a1_stats_flag;
+    A1CTX *a1ctx;
+    A1FRAME a1f;        // quantized values of the frame, captured per granule
+    A1STATS a1st;
+    unsigned char a1_mode_ext_buf[32];
+    unsigned char a1_br_index_buf[32];
+    struct
+    {
+        unsigned int main_pos;
+        signed int mf_bytes;
+    }
+    a1_frame_info[32];
+    unsigned char a1_side_buf[32][32];
+    unsigned char a1_main_buf[MB_TRIGGER + 512 + 1440 + 256];
+    unsigned int a1_side_p0, a1_side_p1;
+    int a1_main_p0, a1_main_p1;
+    unsigned int a1_main_tot, a1_main_sent, a1_mf_tot;
+    signed int a1_main_bytes;
+    unsigned char *a1_scratch;  // receives the stock frames, which are discarded
+
 // encode selector
     int iL3_audio_encode_function;
 // encode selector
@@ -372,6 +401,12 @@ class CMp3Enc
     int L3_pack_head ( unsigned char *bs_out, int pad_flag, int mode_ext );
     int L3_pack_head_vbr ( unsigned char *bs_out, int pad_flag,
                            int mode_ext );
+
+// A1
+    void a1_reset (  );
+    void a1_capture ( int igr );
+    void a1_add_frame ( int stock_bytes, int stock_pool_after );
+    int a1_output ( unsigned char *bs_out );
 
 //------------------- MP3_audio_encode (includes rate conversion)
     int src_encode;

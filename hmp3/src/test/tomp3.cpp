@@ -1038,6 +1038,8 @@ ff_encode ( const fn_char *filename, const fn_char *fileout, E_CONTROL *ec0 )
 	/* fprintf (stderr, "\r  %10u  | %10d / %10d |   %3d%%   | %6.2f / %6.2f  Kbps", */
 	print_progress ( &Encode, in_bytes, out_bytes, ( !stop_encoder ? 100 : (int)(in_bytes*100. / indatasize) ) );
 
+	Encode.a1_print_stats ( stderr );	// only with HMP3_A1STATS=1
+
 	fprintf (stderr, "\n-------------------------------------------------------------------------------");
 	/* fprintf (stderr, "\n Compress Ratio %3.6f%%", out_bytes*100./indatasize ); */
 	fprintf (stderr, "\n Compress Ratio ");
@@ -1157,7 +1159,11 @@ out_usage (  )
 	"\nSBT[short_block_threshold]"
 	"\n          short_block_threshold, default = 700"
 	"\n          Lower values mean increased sensitivity to transients."
-	"\nEC        Display Encoder Setting\n" );
+	"\nEC        Display Encoder Setting"
+	"\n"
+	"\nEnvironment (MPEG-1 VBR): lossless re-coding of every frame (A1) is on."
+	"\n          HMP3_A1=0 stock packing, HMP3_A1=1 keep each global_gain"
+	"\n          (identical PCM in minimp3 too), HMP3_A1STATS=1 print a summary\n" );
 
 	return 0;
 }
